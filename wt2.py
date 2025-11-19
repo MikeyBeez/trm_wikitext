@@ -1,104 +1,126 @@
 """
-TRM: Tiny Recursive Transformer for WikiText-2 (Word-level)
-COMPLETE TRAINING & EVALUATION - Single file, patient-based early stopping
-
-Architecture validated on appropriately-sized benchmark:
-- WikiText-2: 2.1M tokens, 33K vocab
-- Model: 6.8M parameters  
-- Ratio: 3.4 params per example (optimal range!)
-
-Expected: 75-85 PPL (baseline ~85 PPL)
-Training time: ~6-8 hours on RTX 5070 Ti
+Tiny Recursive Model for WikiText-2 Word-Level Language Modeling
+A transformer-based architecture with iterative refinement for word prediction.
 """
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset
-from datasets import load_dataset
-from transformers import AutoTokenizer
-import numpy as np
-import os
+from dataclasses import dataclass
 import math
 import json
-from dataclasses import dataclass
-from itertools import chain
+import os
 import time
 from datetime import datetime
+from collections import Counter
+from torch.utils.checkpoint import checkpoint
+from typing import List, Tuple, Optional
 
-# ===============================
-# CONFIGURATION
-# ===============================
+from datasets import load_dataset
+import numpy as np
+
 @dataclass
-class Config:
-    # Architecture
-    context_size: int = 64
-    chunk_size: int = 4
-    embed_dim: int = 128
-    n_layers: int = 2
-    n_heads: int = 4
-    dropout: float = 0.1
-    n_refinements: int = 2
-    n_recursions: int = 3
+class Configuration:
+    """Model and training configuration"""
+    context_size: int = 32          # Number of context words
+    chunk_size: int = 2             # Number of words to predict per step
+    embed_dim: int = 128            # Embedding dimension
+    n_context_layers: int = 2       # Transformer layers for context encoding
+    n_refine_layers: int = 2        # Transformer layers for refinement
+    n_heads: int = 4                # Number of attention heads
+    dropout: float = 0.1            # Dropout rate
+    n_refinements: int = 2          # Refinement iterations per forward pass
+    n_recursions: int = 3           # Recursive passes within each refinement
     
-    # Training
-    batch_size: int = 32
-    max_epochs: int = 50  # Small dataset = more epochs
-    learning_rate: float = 1e-4
-    weight_decay: float = 0.01
-    grad_clip: float = 1.0
-    warmup_steps: int = 500
+    batch_size: int = 32            # Training batch size
+    max_epochs: int = 50            # Maximum training epochs
+    learning_rate: float = 1e-4     # Learning rate
+    weight_decay: float = 0.01      # Weight decay for regularization
+    grad_clip: float = 1.0          # Gradient clipping threshold
     
-    # Early stopping (ENABLED - appropriate for small dataset)
-    eval_interval: int = 200  # Frequent evaluation
-    eval_iters: int = 50
-    patience: int = 20  # Stop after 20 evals without improvement
-    checkpoint_interval: int = 1000
+    eval_interval: int = 200        # Evaluation frequency (steps)
+    eval_iterations: int = 50       # Number of batches for evaluation
+    patience: int = 20              # Early stopping patience
     
-    # System
-    output_dir: str = "./outputs_wt2"
-    checkpoint_dir: str = "./checkpoints_wt2"
+    output_directory: str = "./outputs_wikitext_word"
+    checkpoint_directory: str = "./checkpoints_wikitext_word"
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
-    tokenizer_name: str = "gpt2"
-    seed: int = 42
-    vocab_size: int = None
-    
+    random_seed: int = 42
+    maximum_vocabulary_size: int = 30000
     resume_from_checkpoint: bool = True
+    gradient_checkpointing: bool = True
 
-import torch.serialization
-torch.serialization.add_safe_globals([Config])
+class WordTokenizer:
+    """Simple word-level tokenizer that splits on whitespace"""
+    
+    def __init__(self, max_vocab_size: int = 30000):
+        self.max_vocab_size = max_vocab_size
+        self.word_to_id = {"<pad>": 0, "<unk>": 1, "<eos>": 2}
+        self.id_to_word = {0: "<pad>", 1: "<unk>", 2: "<eos>"}
+        self.vocabulary_size = 3
+        
+    def build_vocabulary(self, texts: List[str]):
+        """Build vocabulary from training texts"""
+        print("Building word vocabulary from training data...")
+        
+        # Count word frequencies
+        word_counts = Counter()
+        for text in texts:
+            if text and text.strip():
+                words = text.split()
+                word_counts.update(words)
+        
+        # Add most common words to vocabulary
+        for word, count in word_counts.most_common(self.max_vocab_size - 3):
+            if word not in self.word_to_id:
+                self.word_to_id[word] = self.vocabulary_size
+                self.id_to_word[self.vocabulary_size] = word
+                self.vocabulary_size += 1
+        
+        print(f"Vocabulary size: {self.vocabulary_size:,} unique words")
+    
+    def encode(self, text: str) -> List[int]:
+        """Convert text to list of token IDs"""
+        if not text or not text.strip():
+            return []
+        return [self.word_to_id.get(word, self.word_to_id["<unk>"]) 
+                for word in text.split()]
+    
+    def decode(self, token_ids: List[int]) -> str:
+        """Convert token IDs to text"""
+        words = [self.id_to_word.get(int(tok), "<unk>") for tok in token_ids]
+        return " ".join(words)
 
-# ===============================
-# DATASET CLASS
-# ===============================
-class ChunkedDataset(Dataset):
-    def __init__(self, token_ids, context_size, chunk_size):
+class ChunkDataset(Dataset):
+    """Dataset that provides context windows and target chunks"""
+    
+    def __init__(self, token_ids: List[int], context_size: int, chunk_size: int):
         self.data = token_ids
         self.context_size = context_size
         self.chunk_size = chunk_size
         self.length = max(0, len(self.data) - self.context_size - self.chunk_size)
         
         if self.length == 0:
-            raise ValueError(f"Dataset too small! Need at least {context_size + chunk_size} tokens")
+            raise ValueError(f"Dataset too small. Required: {context_size + chunk_size + 1} tokens")
 
     def __len__(self):
         return self.length
 
-    def __getitem__(self, idx):
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
         context = self.data[idx: idx + self.context_size]
         chunk = self.data[idx + self.context_size: idx + self.context_size + self.chunk_size]
         return torch.tensor(context, dtype=torch.long), torch.tensor(chunk, dtype=torch.long)
 
-# ===============================
-# TRANSFORMER BLOCK
-# ===============================
 class TransformerBlock(nn.Module):
+    """Transformer block with causal masking"""
+    
     def __init__(self, embed_dim: int, n_heads: int, dropout: float = 0.1):
         super().__init__()
-        self.ln1 = nn.LayerNorm(embed_dim)
-        self.attn = nn.MultiheadAttention(embed_dim, n_heads, dropout=dropout, batch_first=True)
-        self.ln2 = nn.LayerNorm(embed_dim)
-        self.mlp = nn.Sequential(
+        self.layer_norm1 = nn.LayerNorm(embed_dim)
+        self.attention = nn.MultiheadAttention(embed_dim, n_heads, dropout=dropout, batch_first=True)
+        self.layer_norm2 = nn.LayerNorm(embed_dim)
+        self.feed_forward = nn.Sequential(
             nn.Linear(embed_dim, 4 * embed_dim),
             nn.GELU(),
             nn.Dropout(dropout),
@@ -106,38 +128,52 @@ class TransformerBlock(nn.Module):
             nn.Dropout(dropout)
         )
         
-    def forward(self, x, attn_mask=None):
-        x = x + self.attn(self.ln1(x), self.ln1(x), self.ln1(x), 
-                          attn_mask=attn_mask, need_weights=False)[0]
-        x = x + self.mlp(self.ln2(x))
+    def forward(self, x: torch.Tensor, attention_mask: torch.Tensor = None) -> torch.Tensor:
+        # Self-attention with residual connection
+        attended = self.attention(self.layer_norm1(x), self.layer_norm1(x), self.layer_norm1(x), 
+                                 attn_mask=attention_mask, need_weights=False)[0]
+        x = x + attended
+        
+        # Feed-forward with residual connection
+        x = x + self.feed_forward(self.layer_norm2(x))
         return x
 
-# ===============================
-# TRM MODEL
-# ===============================
 class TinyRecursiveModel(nn.Module):
-    def __init__(self, config: Config):
+    """Recurrently-refined transformer for word-level language modeling"""
+    
+    def __init__(self, config: Configuration):
         super().__init__()
         self.config = config
         
-        self.embedding = nn.Embedding(config.vocab_size, config.embed_dim)
-        self.pos_embedding = nn.Embedding(config.context_size + config.chunk_size, config.embed_dim)
+        self.embedding = nn.Embedding(config.vocabulary_size, config.embed_dim)
+        self.position_embedding = nn.Embedding(config.context_size + config.chunk_size, config.embed_dim)
         
-        self.blocks = nn.ModuleList([
+        self.context_blocks = nn.ModuleList([
             TransformerBlock(config.embed_dim, config.n_heads, config.dropout)
-            for _ in range(config.n_layers)
+            for _ in range(config.n_context_layers)
         ])
         
-        self.ln_f = nn.LayerNorm(config.embed_dim)
-        self.output_head = nn.Linear(config.embed_dim, config.vocab_size, bias=False)
-        self.output_head.weight = self.embedding.weight
+        self.refinement_blocks = nn.ModuleList([
+            TransformerBlock(config.embed_dim, config.n_heads, config.dropout)
+            for _ in range(config.n_refine_layers)
+        ])
         
+        self.layer_norm_final = nn.LayerNorm(config.embed_dim)
+        self.output_projection = nn.Linear(config.embed_dim, config.vocabulary_size, bias=False)
+        self.output_projection.weight = self.embedding.weight
+        
+        # Causal masks
         self.register_buffer("context_mask",
-            torch.triu(torch.ones(config.context_size, config.context_size) * float('-inf'), diagonal=1))
+            torch.triu(torch.full((config.context_size, config.context_size), -1e9), diagonal=1))
         
-        self.apply(self._init_weights)
+        total_length = config.context_size + config.chunk_size
+        combined_mask = torch.triu(torch.full((total_length, total_length), -1e9), diagonal=1)
+        combined_mask[config.context_size:, :config.context_size] = 0
+        self.register_buffer("combined_mask", combined_mask)
         
-    def _init_weights(self, module):
+        self.apply(self._initialize_weights)
+        
+    def _initialize_weights(self, module: nn.Module):
         if isinstance(module, nn.Linear):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
             if module.bias is not None:
@@ -145,497 +181,393 @@ class TinyRecursiveModel(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
     
-    def forward(self, context, chunk):
-        ctx_emb = self.embedding(context)
-        ctx_pos = self.pos_embedding(torch.arange(self.config.context_size, device=context.device))
-        ctx = ctx_emb + ctx_pos
+    def forward(self, context: torch.Tensor, chunk: torch.Tensor = None) -> torch.Tensor:
+        """
+        Forward pass with proper teacher forcing
         
-        for block in self.blocks:
-            ctx = block(ctx, self.context_mask)
+        Args:
+            context: [batch, context_size] - Context words
+            chunk: [batch, chunk_size] - Ground truth chunk (training) or None (generation)
+        """
+        batch_size = context.shape[0]
         
-        chunk_emb = self.embedding(chunk)
-        chunk_pos = self.pos_embedding(
+        # Process context
+        context_embeddings = self.embedding(context)
+        context_positions = self.position_embedding(torch.arange(self.config.context_size, device=context.device))
+        context_hidden = context_embeddings + context_positions
+        
+        for block in self.context_blocks:
+            context_hidden = block(context_hidden, self.context_mask)
+        
+        # Initialize chunk representation
+        if chunk is not None:
+            # Training: Use ground truth for teacher forcing
+            chunk_embeddings = self.embedding(chunk)
+        else:
+            # Generation: Start with <eos> token
+            eos_token_id = 2
+            start_tokens = torch.full((batch_size, self.config.chunk_size), eos_token_id, device=context.device)
+            chunk_embeddings = self.embedding(start_tokens)
+        
+        chunk_positions = self.position_embedding(
             torch.arange(self.config.context_size, 
                         self.config.context_size + self.config.chunk_size,
                         device=context.device)
         )
-        y = chunk_emb + chunk_pos
+        
+        y = chunk_embeddings + chunk_positions
         z = torch.zeros_like(y)
         
-        for refine_step in range(self.config.n_refinements):
-            if refine_step < self.config.n_refinements - 1:
+        # Recursive refinement
+        for refinement_step in range(self.config.n_refinements):
+            if refinement_step < self.config.n_refinements - 1:
                 with torch.no_grad():
-                    y, z = self._refine_once(ctx, y, z)
+                    y, z = self._refine_once(context_hidden, y, z)
             else:
-                y, z = self._refine_once(ctx, y, z)
+                y, z = self._refine_once(context_hidden, y, z)
         
-        y = self.ln_f(y)
-        logits = self.output_head(y)
+        y = self.layer_norm_final(y)
+        logits = self.output_projection(y)
         return logits
     
-    def _refine_once(self, ctx, y, z):
+    def _refine_once(self, context_hidden: torch.Tensor, y: torch.Tensor, z: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Single refinement iteration"""
         for _ in range(self.config.n_recursions):
-            combined = torch.cat([ctx, y + z], dim=1)
-            for block in self.blocks:
-                combined = block(combined, attn_mask=None)
+            combined = torch.cat([context_hidden, y + z], dim=1)
+            
+            for block in self.refinement_blocks:
+                if self.config.gradient_checkpointing and self.training:
+                    combined = checkpoint(block, combined, self.combined_mask, use_reentrant=False)
+                else:
+                    combined = block(combined, self.combined_mask)
+            
             z = combined[:, self.config.context_size:, :]
         
-        combined = torch.cat([ctx, y + z], dim=1)
-        for block in self.blocks:
-            combined = block(combined, attn_mask=None)
+        combined = torch.cat([context_hidden, y + z], dim=1)
+        for block in self.refinement_blocks:
+            if self.config.gradient_checkpointing and self.training:
+                combined = checkpoint(block, combined, self.combined_mask, use_reentrant=False)
+            else:
+                combined = block(combined, self.combined_mask)
         y = combined[:, self.config.context_size:, :]
         
         return y, z
 
-# ===============================
-# TRAINING UTILITIES
-# ===============================
-def get_batch(dataset, batch_size, device):
+def get_batch(dataset: Dataset, batch_size: int, device: str) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Sample a batch from the dataset"""
     indices = torch.randint(len(dataset), (batch_size,))
-    ctxs, chunks = [], []
+    contexts, chunks = [], []
     for idx in indices:
-        ctx, chk = dataset[idx]
-        ctxs.append(ctx)
-        chunks.append(chk)
-    return torch.stack(ctxs).to(device), torch.stack(chunks).to(device)
+        context, chunk = dataset[idx]
+        contexts.append(context)
+        chunks.append(chunk)
+    return torch.stack(contexts).to(device), torch.stack(chunks).to(device)
 
 @torch.no_grad()
-def estimate_loss(model, dataset, config):
+def estimate_loss(model: nn.Module, dataset: Dataset, config: Configuration) -> float:
+    """Estimate loss over multiple batches"""
     model.eval()
     losses = []
     
-    for _ in range(config.eval_iters):
-        ctx, chk = get_batch(dataset, config.batch_size, config.device)
-        logits = model(ctx, chk)
-        loss = F.cross_entropy(logits.reshape(-1, config.vocab_size), chk.reshape(-1))
+    for _ in range(config.eval_iterations):
+        context, target_chunk = get_batch(dataset, config.batch_size, config.device)
+        logits = model(context, chunk=None)
+        loss = F.cross_entropy(logits.reshape(-1, config.vocabulary_size), target_chunk.reshape(-1))
         losses.append(loss.item())
     
     model.train()
     return np.mean(losses)
 
 @torch.no_grad()
-def generate_text(model, tokenizer, prompt, config, max_new_tokens=50):
-    """Generate text with proper initialization"""
+def generate_text(model: nn.Module, tokenizer: WordTokenizer, 
+                  prompt: str, config: Configuration, 
+                  max_new_words: int = 20, temperature: float = 0.8, 
+                  top_k: int = 40) -> None:
+    """Generate text word-by-word"""
     model.eval()
-    print(f"\nPrompt: '{prompt}'")
-    print("Generated: ", end="", flush=True)
+    print(f"\nGeneration prompt: '{prompt}'")
+    print("Generated text: ", end="", flush=True)
     
+    # Encode prompt
     tokens = tokenizer.encode(prompt)
-    if len(tokens) < config.context_size:
-        tokens = [tokenizer.pad_token_id] * (config.context_size - len(tokens)) + tokens
-    else:
+    if len(tokens) > config.context_size:
         tokens = tokens[-config.context_size:]
     
     generated = list(tokens)
+    previous_chunk = None
     
-    for _ in range(max_new_tokens // config.chunk_size):
-        ctx = torch.tensor([generated[-config.context_size:]], dtype=torch.long, device=config.device)
+    num_chunks = max_new_words // config.chunk_size
+    for _ in range(num_chunks):
+        context_tensor = torch.tensor([generated[-config.context_size:]], 
+                                    dtype=torch.long, device=config.device)
         
-        last_token = ctx[:, -1:]
-        seed_chunk = last_token.repeat(1, config.chunk_size)
+        logits = model(context_tensor, chunk=previous_chunk)
+        logits = logits / temperature
         
-        logits = model(ctx, seed_chunk)
-        next_tokens = torch.argmax(logits, dim=-1).squeeze(0).tolist()
-        generated.extend(next_tokens)
+        predicted_tokens = []
+        for position in range(config.chunk_size):
+            position_logits = logits[0, position]
+            
+            if top_k > 0:
+                indices_to_remove = position_logits < torch.topk(position_logits, top_k)[0][..., -1, None]
+                position_logits[indices_to_remove] = -float('inf')
+            
+            probabilities = F.softmax(position_logits, dim=-1)
+            next_token = torch.multinomial(probabilities, 1)
+            predicted_tokens.append(next_token.item())
         
-        new_text = tokenizer.decode(next_tokens)
+        previous_chunk = torch.tensor([predicted_tokens], dtype=torch.long, device=config.device)
+        generated.extend(predicted_tokens)
+        
+        new_text = tokenizer.decode(predicted_tokens)
         print(new_text, end="", flush=True)
     
     print("\n")
     model.train()
 
-def count_parameters(model):
+def count_model_parameters(model: nn.Module) -> int:
+    """Count trainable parameters"""
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
 
-def save_checkpoint(model, optimizer, scheduler, step, epoch, best_val_loss, config, path):
+def save_model_checkpoint(model: nn.Module, optimizer: torch.optim.Optimizer,
+                         step: int, epoch: int, best_validation_loss: float,
+                         config: Configuration, path: str) -> None:
+    """Save training checkpoint"""
     torch.save({
         'model_state_dict': model.state_dict(),
         'optimizer_state_dict': optimizer.state_dict(),
-        'scheduler_state_dict': scheduler.state_dict() if scheduler else None,
-        'step': step,
-        'epoch': epoch,
-        'best_val_loss': best_val_loss,
-        'config': config,
+        'step': int(step),
+        'epoch': int(epoch),
+        'best_validation_loss': float(best_validation_loss),
+        'configuration': {k: v if not isinstance(v, (np.ndarray, np.generic)) else v.item() 
+                         for k, v in vars(config).items()},
     }, path)
 
-def load_checkpoint(path, model, optimizer, scheduler, config):
+def load_model_checkpoint(path: str, model: nn.Module, optimizer: torch.optim.Optimizer,
+                         config: Configuration) -> Tuple[int, int, float]:
+    """Load training checkpoint"""
     try:
-        checkpoint = torch.load(path, weights_only=False)
+        import numpy as np
+        torch.serialization.add_safe_globals([np._NoValue])
+        
+        checkpoint = torch.load(path, map_location=config.device, weights_only=True)
         model.load_state_dict(checkpoint['model_state_dict'])
         optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-        if scheduler and 'scheduler_state_dict' in checkpoint and checkpoint['scheduler_state_dict']:
-            scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
         step = checkpoint['step']
         epoch = checkpoint['epoch']
-        best_val_loss = checkpoint['best_val_loss']
-        print(f"✅ Resumed from checkpoint: step {step:,}, epoch {epoch}, best val loss {best_val_loss:.4f}")
-        return step, epoch, best_val_loss
-    except Exception as e:
-        print(f"❌ Could not load checkpoint: {e}")
+        best_validation_loss = checkpoint['best_validation_loss']
+        print(f"Resumed from step {step:,}, epoch {epoch}, best validation loss: {best_validation_loss:.4f}")
+        return step, epoch, best_validation_loss
+    except Exception as error:
+        print(f"Failed to load checkpoint: {error}")
         return 0, 0, float('inf')
 
-def get_lr(step, config):
-    """Learning rate schedule with warmup"""
-    if step < config.warmup_steps:
-        return config.learning_rate * (step / config.warmup_steps)
-    return config.learning_rate
-
-# ===============================
-# MAIN FUNCTION
-# ===============================
 def main():
-    config = Config()
-    torch.manual_seed(config.seed)
+    configuration = Configuration()
+    torch.manual_seed(configuration.random_seed)
     if torch.cuda.is_available():
-        torch.cuda.manual_seed(config.seed)
+        torch.cuda.manual_seed(configuration.random_seed)
     
-    os.makedirs(config.output_dir, exist_ok=True)
-    os.makedirs(config.checkpoint_dir, exist_ok=True)
+    os.makedirs(configuration.output_directory, exist_ok=True)
+    os.makedirs(configuration.checkpoint_directory, exist_ok=True)
     
-    print("=" * 70)
-    print("TRM: WIKITEXT-2 TRAINING")
-    print("=" * 70)
-    print(f"Device: {config.device}")
-    print(f"Architecture: 6.8M params, 2 layers, recursive refinement")
-    print(f"Dataset: WikiText-2 (appropriately sized for this model)")
-    print(f"Early stopping: ENABLED (patience={config.patience})")
-    print(f"Expected: 75-85 PPL (baseline ~85 PPL)")
-    print("=" * 70)
+    print("=" * 80)
+    print("Tiny Recursive Model: WikiText-2 Word-Level Language Modeling")
+    print("=" * 80)
+    print(f"Computing device: {configuration.device}")
+    print(f"Model architecture:")
+    print(f"  Context encoding layers: {configuration.n_context_layers}")
+    print(f"  Refinement layers: {configuration.n_refine_layers}")
+    print(f"  Attention heads: {configuration.n_heads}")
+    print(f"  Refinement iterations: {configuration.n_refinements}")
+    print(f"  Recursive passes per iteration: {configuration.n_recursions}")
+    print("=" * 80)
     
-    # Load WikiText-2
-    print("\n📚 Loading WikiText-2...")
-    ds_train = load_dataset("wikitext", "wikitext-2-v1", split="train")
-    ds_val   = load_dataset("wikitext", "wikitext-2-v1", split="validation")
-    ds_test  = load_dataset("wikitext", "wikitext-2-v1", split="test")
+    # Load datasets
+    print("\nLoading WikiText-2 dataset...")
+    train_data = load_dataset("wikitext", "wikitext-2-v1", split="train")
+    validation_data = load_dataset("wikitext", "wikitext-2-v1", split="validation")
+    test_data = load_dataset("wikitext", "wikitext-2-v1", split="test")
 
-    print("🔤 Loading tokenizer...")
-    tokenizer = AutoTokenizer.from_pretrained(config.tokenizer_name, model_max_length=100000)
-    tokenizer.add_special_tokens({'pad_token': '[PAD]'})
-    config.vocab_size = len(tokenizer)
-
-    print("⚙️  Tokenizing datasets...")
-    def tokenize_function(examples):
-        return tokenizer(examples["text"], truncation=False, padding=False)
-
-    tokenized_train = ds_train.map(tokenize_function, batched=True, remove_columns=["text"])
-    tokenized_val   = ds_val.map(tokenize_function, batched=True, remove_columns=["text"])
-    tokenized_test  = ds_test.map(tokenize_function, batched=True, remove_columns=["text"])
-
-    train_tokens = list(chain.from_iterable(tokenized_train['input_ids']))
-    val_tokens   = list(chain.from_iterable(tokenized_val['input_ids']))
-    test_tokens  = list(chain.from_iterable(tokenized_test['input_ids']))
-
-    train_dataset = ChunkedDataset(train_tokens, config.context_size, config.chunk_size)
-    val_dataset   = ChunkedDataset(val_tokens, config.context_size, config.chunk_size)
-    test_dataset  = ChunkedDataset(test_tokens, config.context_size, config.chunk_size)
-
-    steps_per_epoch = len(train_dataset) // config.batch_size
+    # Create word-level tokenizer
+    tokenizer = WordTokenizer(max_vocab_size=configuration.maximum_vocabulary_size)
     
-    print(f"\n📊 Dataset Statistics:")
-    print(f"  Training tokens: {len(train_tokens):,}")
-    print(f"  Training examples: {len(train_dataset):,}")
-    print(f"  Validation examples: {len(val_dataset):,}")
-    print(f"  Test examples: {len(test_dataset):,}")
-    print(f"  Vocabulary size: {config.vocab_size:,}")
-    print(f"  Steps per epoch: {steps_per_epoch:,}")
-    print(f"  Max epochs: {config.max_epochs}")
-    print(f"  Total training steps: {steps_per_epoch * config.max_epochs:,}")
+    # Extract non-empty texts
+    train_texts = [text for text in train_data["text"] if text and text.strip()]
+    validation_texts = [text for text in validation_data["text"] if text and text.strip()]
+    test_texts = [text for text in test_data["text"] if text and text.strip()]
+    
+    # Build vocabulary from training data
+    tokenizer.build_vocabulary(train_texts)
+    configuration.vocabulary_size = tokenizer.vocabulary_size
+
+    # Tokenize all texts with document boundaries
+    def tokenize_texts(texts: List[str]) -> List[int]:
+        tokenized = []
+        for text in texts:
+            if text and text.strip():
+                tokens = tokenizer.encode(text)
+                tokenized.extend(tokens + [tokenizer.word_to_id["<eos>"]])
+        return tokenized
+
+    train_tokens = tokenize_texts(train_texts)
+    validation_tokens = tokenize_texts(validation_texts)
+    test_tokens = tokenize_texts(test_texts)
+
+    # Create datasets
+    train_dataset = ChunkDataset(train_tokens, configuration.context_size, configuration.chunk_size)
+    validation_dataset = ChunkDataset(validation_tokens, configuration.context_size, configuration.chunk_size)
+    test_dataset = ChunkDataset(test_tokens, configuration.context_size, configuration.chunk_size)
+
+    steps_per_epoch = len(train_dataset) // configuration.batch_size
+    print(f"Training tokens: {len(train_tokens):,} | Steps per epoch: {steps_per_epoch:,}")
 
     # Initialize model
-    print("\n🏗️  Initializing model...")
-    model = TinyRecursiveModel(config).to(config.device)
-    num_params = count_parameters(model)
-    
-    print(f"\n📐 Model Architecture:")
-    print(f"  Total parameters: {num_params:,}")
-    print(f"  Layers: {config.n_layers}")
-    print(f"  Embedding dim: {config.embed_dim}")
-    print(f"  Attention heads: {config.n_heads}")
-    print(f"  Refinements: {config.n_refinements}")
-    print(f"  Recursions: {config.n_recursions}")
-    print(f"  Forward passes per example: {1 + config.n_refinements * (config.n_recursions + 1)}")
-    
-    # Capacity analysis
-    examples_per_param = len(train_dataset) / num_params
-    print(f"\n🔬 Capacity Analysis:")
-    print(f"  Training examples: {len(train_dataset):,}")
-    print(f"  Model parameters: {num_params:,}")
-    print(f"  Ratio: {examples_per_param:.2f} examples per parameter")
-    if examples_per_param < 0.5:
-        print(f"  ✅ SAFE ZONE: Plenty of capacity (< 0.5 examples/param)")
-    elif examples_per_param < 1.0:
-        print(f"  ⚠️  MODERATE: Approaching limits (0.5-1.0 examples/param)")
-    else:
-        print(f"  🚨 DANGER: Insufficient capacity (> 1.0 examples/param)")
+    model = TinyRecursiveModel(configuration).to(configuration.device)
+    total_parameters = count_model_parameters(model)
+    print(f"Model parameters: {total_parameters:,}")
     
     optimizer = torch.optim.AdamW(
-        model.parameters(), 
-        lr=config.learning_rate, 
-        weight_decay=config.weight_decay
+        model.parameters(),
+        lr=configuration.learning_rate,
+        weight_decay=configuration.weight_decay
     )
-    
-    scheduler = None  # Simple fixed LR for now
 
-    # Try to resume
-    resume_path = os.path.join(config.checkpoint_dir, "latest_checkpoint.pt")
-    start_step = 0
-    start_epoch = 0
-    best_val_loss = float("inf")
+    # Resume from checkpoint if available
+    checkpoint_path = os.path.join(configuration.checkpoint_directory, "latest_checkpoint.pt")
+    start_step, start_epoch, best_validation_loss = 0, 0, float('inf')
     
-    if config.resume_from_checkpoint and os.path.exists(resume_path):
-        print(f"\n📂 Found checkpoint: {resume_path}")
-        start_step, start_epoch, best_val_loss = load_checkpoint(resume_path, model, optimizer, scheduler, config)
-    else:
-        print("\n🆕 Starting fresh training")
+    if configuration.resume_from_checkpoint and os.path.exists(checkpoint_path):
+        start_step, start_epoch, best_validation_loss = load_model_checkpoint(
+            checkpoint_path, model, optimizer, configuration
+        )
 
     # Training loop
-    print("\n" + "=" * 70)
-    print("🚀 STARTING TRAINING")
-    print("=" * 70)
-    print(f"Early stopping patience: {config.patience} evaluations")
-    print(f"Started at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    print("=" * 70)
+    print("\nStarting training...")
     
-    best_val_ppl = float("inf") if best_val_loss == float("inf") else math.exp(best_val_loss)
+    best_validation_perplexity = float("inf") if best_validation_loss == float('inf') else math.exp(best_validation_loss)
     patience_counter = 0
-    best_model_path = os.path.join(config.output_dir, "trm_wikitext2_best.pt")
+    best_model_path = os.path.join(configuration.output_directory, "best_model.pt")
     
     training_history = []
-    start_time = time.time()
-    step = start_step
-    
-    # Track if training completed successfully
-    training_completed = False
-    early_stopped = False
+    training_start_time = time.time()
+    current_step = start_step
+    early_stop_triggered = False
 
-    for epoch in range(start_epoch, config.max_epochs):
-        print(f"\n{'='*70}")
-        print(f"📖 EPOCH {epoch + 1}/{config.max_epochs}")
-        print(f"{'='*70}")
-        
+    for epoch in range(start_epoch, configuration.max_epochs):
+        print(f"\nEpoch {epoch + 1}/{configuration.max_epochs}")
         epoch_losses = []
         
-        for batch_idx in range(steps_per_epoch):
-            if epoch == start_epoch and step > 0 and batch_idx < (step % steps_per_epoch):
+        for batch_index in range(steps_per_epoch):
+            # Skip already completed steps when resuming
+            if epoch == start_epoch and current_step > 0 and batch_index < (current_step % steps_per_epoch):
                 continue
                 
-            ctx, chk = get_batch(train_dataset, config.batch_size, config.device)
+            context_batch, chunk_batch = get_batch(train_dataset, configuration.batch_size, configuration.device)
             
-            logits = model(ctx, chk)
-            loss = F.cross_entropy(logits.reshape(-1, config.vocab_size), chk.reshape(-1))
+            # Forward pass
+            logits = model(context_batch, chunk_batch)
+            loss = F.cross_entropy(logits.reshape(-1, configuration.vocabulary_size), chunk_batch.reshape(-1))
             
+            # Backward pass
             optimizer.zero_grad()
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), config.grad_clip)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), configuration.grad_clip)
             optimizer.step()
             
             epoch_losses.append(loss.item())
-            step += 1
+            current_step += 1
             
-            # Evaluation
-            if step % config.eval_interval == 0:
-                train_loss = np.mean(epoch_losses[-100:]) if len(epoch_losses) >= 100 else np.mean(epoch_losses)
-                val_loss = estimate_loss(model, val_dataset, config)
-                val_ppl = math.exp(min(val_loss, 20))
+            # Periodic evaluation
+            if current_step % configuration.eval_interval == 0:
+                recent_train_loss = np.mean(epoch_losses[-100:]) if len(epoch_losses) >= 100 else np.mean(epoch_losses)
+                validation_loss = estimate_loss(model, validation_dataset, configuration)
+                validation_perplexity = math.exp(min(validation_loss, 20))
                 
-                elapsed = (time.time() - start_time) / 3600
-                total_steps = steps_per_epoch * config.max_epochs
-                progress = (step / total_steps) * 100
+                elapsed_hours = (time.time() - training_start_time) / 3600
                 
-                print(f"\n[{datetime.now().strftime('%H:%M:%S')}] Step {step:,} | Epoch {epoch+1}/{config.max_epochs} | {elapsed:.2f}h")
-                print(f"  Progress: {progress:.1f}%")
-                print(f"  Train loss: {train_loss:.4f}")
-                print(f"  Val loss:   {val_loss:.4f}")
-                print(f"  Val PPL:    {val_ppl:.2f}")
+                print(f"\n[{datetime.now().strftime('%H:%M:%S')}] Step {current_step:,} | {elapsed_hours:.2f} hours")
+                print(f"  Training loss: {recent_train_loss:.4f}")
+                print(f"  Validation loss: {validation_loss:.4f}")
+                print(f"  Validation perplexity: {validation_perplexity:.2f}")
                 
                 training_history.append({
-                    "step": step,
-                    "epoch": epoch + 1,
-                    "train_loss": train_loss,
-                    "val_loss": val_loss,
-                    "val_ppl": val_ppl,
-                    "elapsed_hours": elapsed
+                    "step": current_step,
+                    "training_loss": recent_train_loss,
+                    "validation_loss": validation_loss,
+                    "validation_perplexity": validation_perplexity,
                 })
                 
-                if val_loss < best_val_loss:
-                    improvement = best_val_loss - val_loss
-                    print(f"  ✅ NEW BEST! Improvement: {improvement:.4f}")
-                    best_val_loss = val_loss
-                    best_val_ppl = val_ppl
+                # Save best model
+                if validation_loss < best_validation_loss:
+                    print("  New best validation loss!")
+                    best_validation_loss = validation_loss
+                    best_validation_perplexity = validation_perplexity
                     patience_counter = 0
-                    
-                    save_checkpoint(model, optimizer, scheduler, step, epoch, best_val_loss, config, best_model_path)
-                    print(f"  💾 Saved best model")
+                    save_model_checkpoint(
+                        model, optimizer, current_step, epoch,
+                        best_validation_loss, configuration, best_model_path
+                    )
                 else:
                     patience_counter += 1
-                    print(f"  ⏳ No improvement. Patience: {patience_counter}/{config.patience}")
+                    print(f"  No improvement. Patience: {patience_counter}/{configuration.patience}")
                     
-                    if patience_counter >= config.patience:
-                        print("\n" + "=" * 70)
-                        print("🛑 EARLY STOPPING TRIGGERED")
-                        print("=" * 70)
-                        early_stopped = True
+                    if patience_counter >= configuration.patience:
+                        print("\nEarly stopping triggered.")
+                        early_stop_triggered = True
                         break
             
-            # Regular checkpointing
-            if step % config.checkpoint_interval == 0:
-                checkpoint_path = os.path.join(config.checkpoint_dir, "latest_checkpoint.pt")
-                save_checkpoint(model, optimizer, scheduler, step, epoch, best_val_loss, config, checkpoint_path)
-            
             # Progress indicator
-            if step % 50 == 0 and step % config.eval_interval != 0:
-                print(f"  Step {step:,} | Loss: {epoch_losses[-1]:.4f}", end="\r")
+            if current_step % 50 == 0 and current_step % configuration.eval_interval != 0:
+                print(f"  Step {current_step:,} | Loss: {epoch_losses[-1]:.4f}", end="\r")
         
-        if early_stopped:
+        if early_stop_triggered:
             break
-    
-    if not early_stopped:
-        training_completed = True
 
-    # Training summary
-    total_time = (time.time() - start_time) / 3600
+    total_training_time = (time.time() - training_start_time) / 3600
+    print(f"\nTraining complete: {total_training_time:.2f} hours")
+    print(f"Best validation perplexity: {best_validation_perplexity:.2f}")
     
-    print("\n" + "=" * 70)
-    print("✅ TRAINING COMPLETE!")
-    print("=" * 70)
-    print(f"Total time: {total_time:.2f} hours ({total_time * 60:.1f} minutes)")
-    print(f"Total steps: {step:,}")
-    print(f"Best validation perplexity: {best_val_ppl:.2f}")
-    print(f"Finished at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    
-    # Load best model
+    # Load best model for final evaluation
     if os.path.exists(best_model_path):
-        try:
-            checkpoint = torch.load(best_model_path, weights_only=False)
-            model.load_state_dict(checkpoint['model_state_dict'])
-            print(f"\n📂 Loaded best model from step {checkpoint['step']:,}")
-        except Exception as e:
-            print(f"⚠️  Warning: Could not load best model: {e}")
+        checkpoint = torch.load(best_model_path, map_location=configuration.device, weights_only=True)
+        model.load_state_dict(checkpoint['model_state_dict'])
     
-    # Test evaluation
-    print("\n" + "=" * 70)
-    print("🧪 FINAL EVALUATION ON TEST SET")
-    print("=" * 70)
+    # Final test evaluation
+    test_loss = estimate_loss(model, test_dataset, configuration)
+    test_perplexity = math.exp(min(test_loss, 20))
     
-    test_loss = estimate_loss(model, test_dataset, config)
-    test_ppl = math.exp(min(test_loss, 20))
+    print("\nFinal Test Results:")
+    print(f"  Test loss: {test_loss:.4f}")
+    print(f"  Test perplexity: {test_perplexity:.2f}")
+    print(f"  Model parameters: {total_parameters:,}")
+    print(f"  Training time: {total_training_time:.2f} hours")
     
-    print(f"\n📊 Test Results:")
-    print(f"  Test Loss:       {test_loss:.4f}")
-    print(f"  Test Perplexity: {test_ppl:.2f}")
+    # Text generation examples
+    print("\nText Generation Examples (temperature=0.8, top_k=40):")
+    generation_prompts = ["The history of", "In the early", "Scientists have discovered"]
+    for prompt in generation_prompts:
+        generate_text(model, tokenizer, prompt, configuration, max_new_words=20)
     
-    # Compare to baselines
-    print(f"\n📈 Comparison to Published Baselines (WikiText-2):")
-    print(f"  Standard LSTM (~10M):      ~99 PPL")
-    print(f"  Standard Transformer:      ~85 PPL")
-    print(f"  Transformer-XL (~41M):     ~58 PPL (SOTA)")
-    print(f"  Your TRM (6.8M):           {test_ppl:.2f} PPL")
-    
-    if test_ppl < 65:
-        print(f"\n🏆 OUTSTANDING: Near-SOTA performance with 6× fewer params!")
-        rating = "outstanding"
-    elif test_ppl < 75:
-        print(f"\n🎉 EXCELLENT: Better than standard transformers with 30% fewer params!")
-        rating = "excellent"
-    elif test_ppl < 85:
-        print(f"\n✅ STRONG: Competitive with standard transformers, fewer parameters!")
-        rating = "strong"
-    elif test_ppl < 100:
-        print(f"\n✅ GOOD: Respectable performance for model size")
-        rating = "good"
-    else:
-        print(f"\n⚠️  Room for improvement vs baselines")
-        rating = "needs_improvement"
-    
-    # Calculate parameter efficiency
-    if test_ppl < 100:
-        baseline_params = 10_000_000
-        baseline_ppl = 85
-        efficiency = (baseline_params / baseline_ppl) / (num_params / test_ppl)
-        print(f"\n💡 Parameter Efficiency Analysis:")
-        print(f"  Baseline: 10M params @ 85 PPL")
-        print(f"  Your TRM: {num_params/1e6:.1f}M params @ {test_ppl:.2f} PPL")
-        print(f"  Efficiency gain: {efficiency:.2f}× better")
-    
-    # Save results
-    results = {
-        "dataset": "WikiText-2",
-        "model": "TRM (Tiny Recursive Model)",
-        "training_completed": training_completed,
-        "early_stopped": early_stopped,
-        "test_loss": test_loss,
-        "test_perplexity": test_ppl,
-        "best_val_loss": best_val_loss,
-        "best_val_perplexity": best_val_ppl,
-        "rating": rating,
-        "total_steps": step,
-        "total_epochs": epoch + 1,
-        "training_time_hours": total_time,
-        "model_parameters": num_params,
-        "steps_per_epoch": steps_per_epoch,
-        "examples_per_parameter": examples_per_param,
-        "config": {
-            "context_size": config.context_size,
-            "chunk_size": config.chunk_size,
-            "embed_dim": config.embed_dim,
-            "n_layers": config.n_layers,
-            "n_refinements": config.n_refinements,
-            "n_recursions": config.n_recursions,
-            "learning_rate": config.learning_rate,
-            "batch_size": config.batch_size,
-            "patience": config.patience,
-        },
+    # Save final results
+    final_results = {
+        "test_perplexity": test_perplexity,
+        "best_validation_perplexity": best_validation_perplexity,
+        "total_parameters": total_parameters,
+        "training_time_hours": total_training_time,
         "training_history": training_history,
-        "baselines": {
-            "lstm_10m": 99,
-            "transformer_standard": 85,
-            "transformer_xl_41m": 58
-        }
+        "configuration": vars(configuration)
     }
     
-    results_path = os.path.join(config.output_dir, f"trm_wikitext2_results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json")
-    with open(results_path, "w") as f:
-        json.dump(results, f, indent=2)
-    print(f"\n💾 Results saved to: {results_path}")
+    results_file = os.path.join(
+        configuration.output_directory,
+        f"final_results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+    )
+    with open(results_file, "w") as file:
+        json.dump(final_results, file, indent=2)
     
-    # Text generation samples
-    print("\n" + "=" * 70)
-    print("📝 SAMPLE TEXT GENERATION")
-    print("=" * 70)
-    
-    test_prompts = [
-        "The history of",
-        "In the early",
-        "Scientists have discovered"
-    ]
-    
-    for prompt in test_prompts:
-        generate_text(model, tokenizer, prompt, config, max_new_tokens=40)
-    
-    # Final summary
-    print("\n" + "=" * 70)
-    print("🎯 EXPERIMENT COMPLETE!")
-    print("=" * 70)
-    print(f"\n📊 Final Results:")
-    print(f"  Model: TRM with recursive refinement")
-    print(f"  Parameters: {num_params:,} (6.8M)")
-    print(f"  Dataset: WikiText-2")
-    print(f"  Training time: {total_time:.2f}h")
-    print(f"  Validation PPL: {best_val_ppl:.2f}")
-    print(f"  Test PPL: {test_ppl:.2f}")
-    print(f"  Rating: {rating.upper()}")
-    
-    print(f"\n🎓 Key Findings:")
-    print(f"  ✅ TRM successfully trained on WikiText-2")
-    print(f"  ✅ Appropriate model size (3.4:1 param/example ratio)")
-    print(f"  ✅ No catastrophic forgetting (early stopping worked)")
-    if test_ppl < 85:
-        print(f"  ✅ Better than standard transformer baselines")
-        print(f"  ✅ Parameter efficiency demonstrated")
-    
-    print(f"\n📚 Ready for paper writing!")
-    print(f"  Results file: {results_path}")
-    print(f"  Best model: {best_model_path}")
+    print(f"\nResults saved to: {results_file}")
+    print("=" * 80)
 
 if __name__ == "__main__":
     main()
